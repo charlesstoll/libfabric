@@ -43,7 +43,7 @@ struct efa_rdm_pke *efa_rdm_pke_alloc(struct efa_rdm_ep *ep,
 				      enum efa_rdm_pke_alloc_type alloc_type)
 {
 	struct efa_rdm_pke *pkt_entry;
-	char *wiredata;
+	char *wiredata = NULL;
 	void *mr = NULL;
 
 	/* Allocate the dense pke metadata from its pool. */
@@ -52,15 +52,15 @@ struct efa_rdm_pke *efa_rdm_pke_alloc(struct efa_rdm_ep *ep,
 		return NULL;
 
 	/* Allocate the wiredata bounce buffer from the pool the caller
-	 * selected for this path. For device-visible pools this returns the
-	 * buffer's region MR in `mr`; for the unregistered unexp/ooo pools
-	 * `mr` stays NULL.
+	 * selected for this path, and capture its registration in `mr`.
+	 * bounce_pool is NULL for pkes that do not use a wiredata buffer.
 	 */
-	assert(bounce_pool);
-	wiredata = ofi_buf_alloc_ex(bounce_pool, &mr);
-	if (!wiredata) {
-		ofi_buf_free(pkt_entry);
-		return NULL;
+	if (bounce_pool) {
+		wiredata = ofi_buf_alloc_ex(bounce_pool, &mr);
+		if (!wiredata) {
+			ofi_buf_free(pkt_entry);
+			return NULL;
+		}
 	}
 
 #ifdef ENABLE_EFA_POISONING
@@ -81,7 +81,8 @@ struct efa_rdm_pke *efa_rdm_pke_alloc(struct efa_rdm_ep *ep,
 	 * live in different pools. This clobbers the wiredata pointer field,
 	 * which is (re)assigned below after poisoning. */
 	efa_rdm_poison_mem_region(pkt_entry, pkt_pool->attr.size);
-	efa_rdm_poison_mem_region(wiredata, bounce_pool->attr.size);
+	if (wiredata)
+		efa_rdm_poison_mem_region(wiredata, bounce_pool->attr.size);
 	pkt_entry->gen = gen;
 #if ENABLE_DEBUG
 	pkt_entry->debug_info = debug_info;
@@ -126,7 +127,7 @@ struct efa_rdm_pke *efa_rdm_pke_alloc(struct efa_rdm_ep *ep,
 	 * NOT exceed the memory registration size. Therefore pkt_entry->pkt_size
 	 * should be adjusted according to the actual data size.
 	 */
-	pkt_entry->pkt_size = bounce_pool->attr.size;
+	pkt_entry->pkt_size = bounce_pool ? bounce_pool->attr.size : 0;
 	pkt_entry->alloc_type = alloc_type;
 	pkt_entry->flags = EFA_RDM_PKE_IN_USE;
 	pkt_entry->next = NULL;
@@ -718,7 +719,7 @@ int efa_rdm_pke_write(struct efa_rdm_pke *pkt_entry)
 	struct efa_qp *qp;
 	struct efa_rdm_av_entry *av_entry;
 	struct ibv_sge sge;
-	struct efa_rdm_rma_context_pkt *rma_context_pkt;
+	struct efa_rdm_ope_write_segment seg;
 	struct efa_rdm_ope *txe;
 	bool self_comm;
 	void *local_buf;
@@ -737,12 +738,14 @@ int efa_rdm_pke_write(struct efa_rdm_pke *pkt_entry)
 	qp = ep->base_ep.qp;
 	txe = pkt_entry->ope;
 
-	rma_context_pkt = (struct efa_rdm_rma_context_pkt *)pkt_entry->wiredata;
-	local_buf = rma_context_pkt->local_buf;
-	len = rma_context_pkt->seg_size;
-	desc = rma_context_pkt->desc;
-	remote_buf = rma_context_pkt->remote_buf;
-	remote_key = rma_context_pkt->remote_key;
+	/* Recompute this segment's parameters from the txe and its start
+	 * offset. */
+	efa_rdm_ope_get_write_segment(txe, pkt_entry->rma_seg_start, &seg);
+	local_buf = seg.local_buf;
+	len = seg.seg_size;
+	desc = seg.desc;
+	remote_buf = seg.remote_buf;
+	remote_key = seg.remote_key;
 
 
 	self_comm = (txe->peer == NULL);
@@ -768,11 +771,15 @@ int efa_rdm_pke_write(struct efa_rdm_pke *pkt_entry)
 		cq_data = txe->cq_entry.data;
 	}
 
-	sge.addr = (uint64_t)local_buf;
-	sge.length = len;
-	sge.lkey = ((struct efa_mr *)desc)->lkey;
+	if (len) {
+		sge.addr = (uint64_t)local_buf;
+		sge.length = len;
+		sge.lkey = ((struct efa_mr *)desc)->lkey;
+	}
 
-	err = efa_qp_post_write(qp, &sge, 1, NULL, false, remote_key, remote_buf, wr_id,
+	/* A 0-byte write posts no SGE. */
+	err = efa_qp_post_write(qp, len ? &sge : NULL, len ? 1 : 0, NULL, false,
+				remote_key, remote_buf, wr_id,
 				cq_data, txe->fi_flags, ah, qpn, qkey);
 
 #if ENABLE_DEBUG
